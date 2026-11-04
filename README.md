@@ -41,12 +41,16 @@ structure as the musevm repository):
 - `Dockerfile` — multi-stage: stage 1 reassembles and SHA-256-verifies the
   bzImage from the chunks above; the final image (Debian trixie-slim)
   carries the verified artifact at `/opt/musevm-kernel/<version>/`, the
-  kernel build toolchain, and QEMU for boot testing.
+  kernel build toolchain, QEMU for boot testing, and the agent-managed
+  daemons (tailscaled 1.104.5, cloudflared 2026.10.7, Apache httpd 2.4.69
+  built from source on :8081).
 - `src/index.ts` — Worker with a `/cf-containers` control page: container
-  start/stop/restart/status, kernel artifact status, and a QEMU boot
+  start/stop/restart/status, kernel artifact status, a QEMU boot
   smoke test (the image has no root filesystem, so reaching the VFS
-  root-mount panic is the success signal). Optional `CONTROL_TOKEN`
-  secret enables HMAC-signed control API access.
+  root-mount panic is the success signal), and Tailscale / cloudflared /
+  Apache panels with status and start/stop (daemon secrets TS_AUTHKEY
+  and TUNNEL_TOKEN are set per-Worker with `wrangler secret put`).
+  Optional `CONTROL_TOKEN` secret enables HMAC-signed control API access.
 - `container-agent.py` — in-container agent on port 8080 backing the
   control page.
 - `SPEC.musevm-kernel.SETUP.md` — full setup spec and deploy checklist.

@@ -9,8 +9,12 @@ import { Container, getContainer } from "@cloudflare/containers";
 //                                       container instance lifecycle
 //   *    /cf-containers/agent/<path>    proxied to the in-container agent
 //                                       (container-agent.py on port 8080):
-//     GET  agent/status                 system + kernel artifact status
+//     GET  agent/status                 system + kernel artifact status,
+//                                       tailscale / cloudflared / apache
 //     POST agent/kernel/boot-test       QEMU boot smoke test of the bzImage
+//     POST agent/tailscale/start|stop   tailscaled (userspace networking)
+//     POST agent/cloudflared/start|stop cloudflared tunnel run
+//     POST agent/apache/start|stop      Apache httpd (source build, :8081)
 //
 // The image carries the minimized kernel artifact (bzImage + its .config,
 // reassembled and SHA-256-verified at image build time) plus the kernel
@@ -24,9 +28,37 @@ import { Container, getContainer } from "@cloudflare/containers";
 // 300 s off are rejected. The secret itself is never sent. Without it the
 // page is open to anyone who knows the URL — put the Worker behind
 // Cloudflare Access before using this beyond experiments.
-export class KernelContainer extends Container {
+export class KernelContainer extends Container<Env> {
   defaultPort = 8080;
   sleepAfter = "10m";
+
+  // Forward an allowlist of Worker env entries (vars and secrets) into the
+  // container process environment. Without this, values set with
+  // `wrangler secret put` / [vars] never reach the agent inside the
+  // container, and tailscaled / cloudflared stay unconfigured.
+  // Secrets are forwarded as values only; they are never logged here.
+  //
+  // This is assigned in the constructor, NOT via a `get envVars()`
+  // accessor: in @cloudflare/containers the base class declares
+  // `envVars = {}` as a class field, whose initializer defines an own
+  // property on the instance and permanently shadows a subclass getter —
+  // a getter here would silently always yield {} (verified against
+  // 0.3.7). A plain assignment after super() replaces that {}.
+  constructor(ctx: DurableObjectState<{}>, env: Env) {
+    super(ctx, env);
+    const out: Record<string, string> = {};
+    for (const k of [
+      "TS_AUTHKEY",
+      "TS_HOSTNAME",
+      "TS_LOGIN_SERVER",
+      "TUNNEL_TOKEN",
+      "APACHE_TUNNEL_HOSTNAME",
+    ] as const) {
+      const v = env[k];
+      if (v) out[k] = v;
+    }
+    this.envVars = out;
+  }
 
   async startContainer() {
     await this.start();
@@ -64,6 +96,12 @@ export class KernelContainer extends Container {
 interface Env {
   KERNEL_CONTAINER: DurableObjectNamespace<KernelContainer>;
   CONTROL_TOKEN?: string;
+  // Forwarded into the container (see KernelContainer.envVars):
+  TS_AUTHKEY?: string;
+  TS_HOSTNAME?: string;
+  TS_LOGIN_SERVER?: string;
+  TUNNEL_TOKEN?: string;
+  APACHE_TUNNEL_HOSTNAME?: string;
 }
 
 const INSTANCE = "main";
@@ -112,6 +150,33 @@ const CONTROL_PAGE = `<!doctype html>
   <button data-call="POST /cf-containers/status #out-main">状態を更新</button>
 </div>
 <pre id="out-main">…</pre>
+
+<h2>Tailscale</h2>
+<p class="note">tailscaled は userspace-networking モード（この環境には /dev/net/tun がないため）。接続にはコンテナ側の環境変数 TS_AUTHKEY が必要。</p>
+<div class="row">
+  <button data-call="GET /cf-containers/agent/status #out-ts">状態を取得</button>
+  <button id="btn-ts-start" data-confirm="tailscaled を起動" data-call="POST /cf-containers/agent/tailscale/start #out-ts">tailscaled 起動</button>
+  <button id="btn-ts-stop" data-confirm="tailscaled を停止" data-call="POST /cf-containers/agent/tailscale/stop #out-ts">tailscaled 停止</button>
+</div>
+<pre id="out-ts">…</pre>
+
+<h2>Cloudflared トンネル</h2>
+<p class="note">起動にはコンテナ側の環境変数 TUNNEL_TOKEN が必要（cloudflared tunnel run --token）。</p>
+<div class="row">
+  <button data-call="GET /cf-containers/agent/status #out-cf">状態を取得</button>
+  <button id="btn-cf-start" data-confirm="cloudflared を起動" data-call="POST /cf-containers/agent/cloudflared/start #out-cf">cloudflared 起動</button>
+  <button id="btn-cf-stop" data-confirm="cloudflared を停止" data-call="POST /cf-containers/agent/cloudflared/stop #out-cf">cloudflared 停止</button>
+</div>
+<pre id="out-cf">…</pre>
+
+<h2>Apache httpd</h2>
+<p class="note">Apache は localhost:8081 で待ち受け、トンネルの公開ホスト名（APACHE_TUNNEL_HOSTNAME）はそこへ割り当てる。トークン方式の場合はダッシュボード側で同じ割り当てを行う。CGI と SSI（#exec 可）が有効で、確認用に /test.shtml と /cgi-bin/test.cgi が入っている。</p>
+<div class="row">
+  <button data-call="GET /cf-containers/agent/status #out-ap">状態を取得</button>
+  <button id="btn-ap-start" data-confirm="Apache を起動" data-call="POST /cf-containers/agent/apache/start #out-ap">Apache 起動</button>
+  <button id="btn-ap-stop" data-confirm="Apache を停止" data-call="POST /cf-containers/agent/apache/stop #out-ap">Apache 停止</button>
+</div>
+<pre id="out-ap">…</pre>
 
 <h2>カーネル成果物</h2>
 <p class="note">イメージに組み込まれた最小化カーネル（bzImage）の状態。サイズと SHA-256（SHA256SUMS との照合結果）を表示する。</p>
@@ -209,11 +274,29 @@ const CONTROL_PAGE = `<!doctype html>
     setPair(start, stop, status);
     if (restart) restart.disabled = (status === 'stopped');
   }
+  function applyDaemonStates(text) {
+    let j;
+    try { j = JSON.parse(text.slice(text.indexOf('{'))); } catch (e) { return; }
+    if (j.tailscale) setPair(document.getElementById('btn-ts-start'), document.getElementById('btn-ts-stop'), j.tailscale.daemon);
+    if (j.cloudflared) setPair(document.getElementById('btn-cf-start'), document.getElementById('btn-cf-stop'), j.cloudflared.process);
+    if (j.apache) setPair(document.getElementById('btn-ap-start'), document.getElementById('btn-ap-stop'), j.apache.process);
+  }
+  async function refreshDaemonStates() {
+    const headers = await authHeaders('GET', '/cf-containers/agent/status');
+    try {
+      const res = await fetch('/cf-containers/agent/status', { headers });
+      applyDaemonStates(await res.text());
+    } catch (e) {}
+  }
   const mainOut = document.getElementById('out-main');
   new MutationObserver(() => {
     const m = /"status"\\s*:\\s*"([a-z_]+)"/.exec(mainOut.textContent || '');
     if (m) applyContainerState(m[1]);
   }).observe(mainOut, { childList: true, characterData: true, subtree: true });
+  for (const id of ['out-ts', 'out-cf', 'out-ap']) {
+    const el = document.getElementById(id);
+    if (el) new MutationObserver(() => applyDaemonStates(el.textContent || '')).observe(el, { childList: true, characterData: true, subtree: true });
+  }
   for (const btn of document.querySelectorAll('button[data-call]')) {
     btn.addEventListener('click', async () => {
       const label = btn.dataset.confirm;
@@ -227,6 +310,7 @@ const CONTROL_PAGE = `<!doctype html>
         }
       }
       await call(btn.dataset.call);
+      if (btn.dataset.call.indexOf('POST /cf-containers/agent/') === 0) refreshDaemonStates();
     });
   }
   async function health() {
@@ -244,6 +328,7 @@ const CONTROL_PAGE = `<!doctype html>
   document.getElementById('hc-btn').addEventListener('click', health);
   health();
   call('POST /cf-containers/status #out-main');
+  call('GET /cf-containers/agent/status #out-ts');
   call('GET /cf-containers/agent/status #out-kernel');
 </script>
 </body>

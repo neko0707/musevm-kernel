@@ -2,20 +2,32 @@
 """Container agent for the musevm-kernel image.
 
 Serves a small HTTP API on port 8080 (the port the Worker proxies to) so the
-/cf-containers page can see the kernel artifact baked into the image and run
-a boot smoke test:
+/cf-containers page can see and control what runs inside the container:
 
-  GET  /agent/status            system stats + kernel artifact status
-                                (presence, size, SHA-256 vs SHA256SUMS,
-                                config path, QEMU version)
+  GET  /agent/status            aggregate status: system stats, kernel
+                                artifact, tailscale / cloudflared / apache
   POST /agent/kernel/boot-test  boot the bzImage under QEMU (TCG emulation,
                                 no KVM here) with a serial console and
                                 classify how far it got. There is no root
                                 filesystem in the image, so a healthy kernel
                                 ends at the VFS root-mount panic — reaching
                                 that panic is the success signal.
+  POST /agent/tailscale/start   start tailscaled (userspace networking) and,
+                                if TS_AUTHKEY is set, `tailscale up` with it
+  POST /agent/tailscale/stop    stop tailscaled
+  POST /agent/cloudflared/start start `cloudflared tunnel run` (needs
+                                TUNNEL_TOKEN in the environment)
+  POST /agent/cloudflared/stop  stop cloudflared
+  POST /agent/apache/start      start Apache httpd (source build, :8081)
+  POST /agent/apache/stop       stop Apache httpd
 
-State lives under $HOME so the agent runs unprivileged.
+The kernel artifact status reports the bzImage baked into the image
+(presence, size, SHA-256 vs SHA256SUMS, config path, QEMU version).
+
+tailscaled runs with --tun=userspace-networking: Cloudflare Containers do
+not provide /dev/net/tun, so kernel-mode WireGuard is unavailable and only
+outbound / proxied traffic through the userspace stack works. State lives
+under $HOME so the agent runs unprivileged.
 """
 
 import hashlib
@@ -25,6 +37,8 @@ import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME = os.path.expanduser("~")
+TS_STATE = os.path.join(HOME, "tailscaled.state")
+TS_SOCK = os.path.join(HOME, "tailscaled.sock")
 PORT = int(os.environ.get("AGENT_PORT", "8080"))
 KERNEL_VERSION = os.environ.get("KERNEL_VERSION", "7.3.1")
 KERNEL_DIR = f"/opt/musevm-kernel/{KERNEL_VERSION}"
@@ -32,6 +46,11 @@ BZIMAGE = os.path.join(KERNEL_DIR, "bzImage")
 CONFIG = os.path.join(KERNEL_DIR, f"config-{KERNEL_VERSION}-minimized")
 SUMS = os.path.join(KERNEL_DIR, "SHA256SUMS")
 BOOT_TEST_TIMEOUT = 90
+
+procs = {"tailscaled": None, "cloudflared": None, "apache": None}
+
+HTTPD = "/usr/local/apache2/bin/httpd"
+APACHE_PORT = 8081
 
 
 def run(cmd, timeout=15):
@@ -41,6 +60,133 @@ def run(cmd, timeout=15):
     except Exception as e:  # noqa: BLE001 - report anything to the caller
         return -1, str(e)
 
+
+def alive(name):
+    p = procs[name]
+    return p is not None and p.poll() is None
+
+
+def stop(name):
+    p = procs[name]
+    if p is None or p.poll() is not None:
+        procs[name] = None
+        return {"stopped": False, "reason": "not running"}
+    p.terminate()
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        p.kill()
+    procs[name] = None
+    return {"stopped": True}
+
+
+# --- tailscale ---------------------------------------------------------------
+
+def tailscale_status():
+    rc, ver = run(["tailscale", "version"])
+    version = ver.splitlines()[0] if ver else None
+    if not alive("tailscaled"):
+        return {"daemon": "stopped", "version": version,
+                "token_configured": bool(os.environ.get("TS_AUTHKEY"))}
+    rc, out = run(["tailscale", "--socket", TS_SOCK, "status", "--json"])
+    if rc != 0:
+        return {"daemon": "running", "version": version, "error": out}
+    try:
+        st = json.loads(out)
+    except ValueError:
+        return {"daemon": "running", "version": version, "unparsed": out}
+    self_ = st.get("Self") or {}
+    return {
+        "daemon": "running",
+        "version": version,
+        "backend_state": st.get("BackendState"),
+        "host": self_.get("HostName"),
+        "dns_name": self_.get("DNSName"),
+        "tailscale_ips": self_.get("TailscaleIPs"),
+        "health": st.get("Health"),
+        "token_configured": bool(os.environ.get("TS_AUTHKEY")),
+    }
+
+
+def tailscale_start():
+    if alive("tailscaled"):
+        return {"started": False, "reason": "already running"}
+    procs["tailscaled"] = subprocess.Popen(
+        ["tailscaled", "--tun=userspace-networking",
+         f"--state={TS_STATE}", f"--socket={TS_SOCK}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    key = os.environ.get("TS_AUTHKEY")
+    if key:
+        hostname = os.environ.get("TS_HOSTNAME") or "musevm-kernel"
+        args = ["tailscale", "--socket", TS_SOCK, "up",
+                f"--auth-key={key}", f"--hostname={hostname}",
+                "--accept-routes=false"]
+        server = os.environ.get("TS_LOGIN_SERVER")
+        if server:
+            args.append(f"--login-server={server}")
+        rc, out = run(args, timeout=30)
+        return {"started": True, "up_rc": rc, "up_output": out}
+    return {"started": True, "up": "skipped: TS_AUTHKEY not set"}
+
+
+# --- cloudflared ---------------------------------------------------------------
+
+def cloudflared_status():
+    rc, ver = run(["cloudflared", "--version"])
+    return {
+        "process": "running" if alive("cloudflared") else "stopped",
+        "version": ver.splitlines()[0] if ver else None,
+        "token_configured": bool(os.environ.get("TUNNEL_TOKEN")),
+    }
+
+
+def cloudflared_start():
+    if alive("cloudflared"):
+        return {"started": False, "reason": "already running"}
+    token = os.environ.get("TUNNEL_TOKEN")
+    if not token:
+        return {"started": False, "reason": "TUNNEL_TOKEN not set"}
+    procs["cloudflared"] = subprocess.Popen(
+        ["cloudflared", "tunnel", "run", "--token", token],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return {"started": True}
+
+
+# --- Apache httpd ---------------------------------------------------------------
+
+def apache_status():
+    rc, ver = run([HTTPD, "-v"])
+    hostname = os.environ.get("APACHE_TUNNEL_HOSTNAME")
+    if os.environ.get("TUNNEL_TOKEN"):
+        mode = "token (ingress assigned in the Cloudflare dashboard)"
+    elif os.path.exists(os.path.join(HOME, ".cloudflared", "config.yml")):
+        mode = "local config (~/.cloudflared/config.yml)"
+    else:
+        mode = "unassigned"
+    return {
+        "process": "running" if alive("apache") else "stopped",
+        "version": ver.splitlines()[0] if ver else None,
+        "listen": f"http://localhost:{APACHE_PORT}",
+        "features": ["cgi (mod_cgid)", "ssi with #exec (Options Includes)"],
+        "smoke_tests": ["/test.shtml", "/cgi-bin/test.cgi"],
+        "tunnel": {"hostname": hostname, "mode": mode,
+                   "service": f"http://localhost:{APACHE_PORT}"},
+    }
+
+
+def apache_start():
+    if alive("apache"):
+        return {"started": False, "reason": "already running"}
+    procs["apache"] = subprocess.Popen(
+        [HTTPD, "-DFOREGROUND"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return {"started": True, "listen": f"http://localhost:{APACHE_PORT}"}
+
+
+# --- kernel artifact ---------------------------------------------------------------
 
 def sha256_of(path):
     h = hashlib.sha256()
@@ -108,6 +254,8 @@ def boot_test():
             "output_tail": out[-2000:]}
 
 
+# --- system ---------------------------------------------------------------
+
 def system_status():
     import shutil
 
@@ -156,6 +304,17 @@ def system_status():
     return {"uptime": up, "loadavg": load, "memory": mem, "disk_root": disk}
 
 
+ROUTES = {
+    ("POST", "/agent/tailscale/start"): lambda: tailscale_start(),
+    ("POST", "/agent/tailscale/stop"): lambda: stop("tailscaled"),
+    ("POST", "/agent/cloudflared/start"): lambda: cloudflared_start(),
+    ("POST", "/agent/cloudflared/stop"): lambda: stop("cloudflared"),
+    ("POST", "/agent/apache/start"): lambda: apache_start(),
+    ("POST", "/agent/apache/stop"): lambda: stop("apache"),
+    ("POST", "/agent/kernel/boot-test"): lambda: boot_test(),
+}
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode()
@@ -168,6 +327,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/agent/status":
             self._json({"agent": "ok", "system": system_status(),
+                        "env_present": {k: bool(os.environ.get(k)) for k in (
+                            "TS_AUTHKEY", "TS_HOSTNAME", "TS_LOGIN_SERVER",
+                            "TUNNEL_TOKEN", "APACHE_TUNNEL_HOSTNAME")},
+                        "tailscale": tailscale_status(),
+                        "cloudflared": cloudflared_status(),
+                        "apache": apache_status(),
                         "kernel": kernel_status()})
         elif self.path == "/":
             self._json({"agent": "ok",
@@ -176,10 +341,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def do_POST(self):
-        if self.path == "/agent/kernel/boot-test":
-            self._json(boot_test())
-        else:
+        fn = ROUTES.get(("POST", self.path))
+        if fn is None:
             self._json({"error": "not found"}, 404)
+            return
+        self._json(fn())
 
     def log_message(self, *args):  # keep stdout quiet
         pass
