@@ -17,10 +17,25 @@ Both stages were exercised with the built 7.3.1 bzImage under QEMU
    and reached an interactive **bash** shell on the console
    (`ROOTFS_SHELL_OK`, `uname -r` → `7.3.1`), then powered off cleanly.
 
-Verified image (built locally; not stored in this repository — 256 MiB
-binary): `rootfs-7.3.1.img`,
-SHA-256 `186902379e30d4c069ca19e2e1d615a32108c48f81cbe3322e2cac9d3c21de7d`.
-Regenerate it with `build-rootfs.sh`.
+The image is published in `7.3.1/` next to the bzImage (gzip +
+Base64 chunks, like the kernel): `rootfs-7.3.1.img.gz.b64.part-00..02`
+with `SHA256SUMS.rootfs`. Reassemble and boot:
+
+```sh
+cd 7.3.1
+cat rootfs-7.3.1.img.gz.b64.part-* | base64 -d > rootfs-7.3.1.img.gz
+sha256sum -c SHA256SUMS.rootfs
+gzip -d rootfs-7.3.1.img.gz
+```
+
+Hashes: the `.img.gz` is
+`62a72ab2a28bc1abe4bac4aef18461a1c39d3fc1164d8a31f7a70616acb65b93`;
+the decompressed 256 MiB `rootfs-7.3.1.img` is
+`186902379e30d4c069ca19e2e1d615a32108c48f81cbe3322e2cac9d3c21de7d`.
+`build-rootfs.sh` regenerates an equivalent image locally. The
+container image does not embed the rootfs — a container cannot boot
+this kernel as its host kernel; the rootfs is for a VM or machine the
+user controls.
 
 ## Contents of the rootfs (milestone scope)
 
